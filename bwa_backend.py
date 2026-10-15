@@ -3,6 +3,7 @@ from __future__ import annotations
 import operator
 import os
 import re
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -16,11 +17,62 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
+# Local dev: loads .env. On Streamlit Cloud there is no .env; the Streamlit app
+# copies st.secrets into os.environ before importing this module.
 load_dotenv()
+
+# Accept either name for the Gemini key (google-genai reads GOOGLE_API_KEY)
+if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+
+
+# ============================================================
+# Image storage: Cloudinary (permanent URL) with local fallback
+# ============================================================
+def _cloudinary_ready() -> bool:
+    return all(
+        os.environ.get(k)
+        for k in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET")
+    )
+
+
+def save_image(img_bytes: bytes, filename: str) -> str:
+    """
+    Returns the string to put inside the markdown ![alt](<here>).
+    - Cloudinary configured -> permanent https URL
+    - Not configured (local dev) or upload fails -> local path images/<name>
+    """
+    name = Path(filename).name  # strips any "images/" prefix (fixes images/images/... bug)
+    stem = Path(name).stem
+
+    if _cloudinary_ready():
+        try:
+            import cloudinary
+            import cloudinary.uploader
+
+            cloudinary.config(
+                cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
+                api_key=os.environ["CLOUDINARY_API_KEY"],
+                api_secret=os.environ["CLOUDINARY_API_SECRET"],
+                secure=True,
+            )
+            res = cloudinary.uploader.upload(
+                img_bytes,
+                public_id=f"{stem}_{uuid.uuid4().hex[:8]}",  # unique per image
+                folder="blog_images",
+            )
+            return res["secure_url"]
+        except Exception:
+            pass  # fall through to local file
+
+    out_dir = Path("images")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / name).write_bytes(img_bytes)
+    return f"images/{name}"
+
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
-# Patches image capability using your 3-node reducer flow:
 #   merge_content -> decide_images -> generate_and_place_images
 # ============================================================
 
@@ -70,10 +122,10 @@ class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-# ---- Image planning schema (ported from your image flow) ----
+# ---- Image planning schema ----
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+    filename: str = Field(..., description="Just a file name, e.g. qkv_flow.png (no folder).")
     alt: str
     caption: str
     prompt: str = Field(..., description="Prompt to send to the image model.")
@@ -84,6 +136,7 @@ class ImageSpec(BaseModel):
 class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
+
 
 class State(TypedDict):
     topic: str
@@ -115,6 +168,7 @@ class State(TypedDict):
 # -----------------------------
 llm = ChatOpenAI(model="gpt-5.6-luna")
 
+
 # -----------------------------
 # 3) Router
 # -----------------------------
@@ -131,6 +185,7 @@ If needs_research=true:
 - Output 3–10 high-signal, scoped queries.
 - For open_book weekly roundup, include queries reflecting last 7 days.
 """
+
 
 def router_node(state: State) -> dict:
     decider = llm.with_structured_output(RouterDecision)
@@ -155,8 +210,10 @@ def router_node(state: State) -> dict:
         "recency_days": recency_days,
     }
 
+
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
+
 
 # -----------------------------
 # 4) Research (Tavily)
@@ -166,6 +223,7 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
         return []
     try:
         from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
+
         tool = TavilySearchResults(max_results=max_results)
         results = tool.invoke({"query": query})
         out: List[dict] = []
@@ -183,6 +241,7 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
     except Exception:
         return []
 
+
 def _iso_to_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
@@ -190,6 +249,7 @@ def _iso_to_date(s: Optional[str]) -> Optional[date]:
         return date.fromisoformat(s[:10])
     except Exception:
         return None
+
 
 RESEARCH_SYSTEM = """You are a research synthesizer.
 
@@ -202,6 +262,7 @@ Rules:
 - Keep snippets short.
 - Deduplicate by URL.
 """
+
 
 def research_node(state: State) -> dict:
     queries = (state.get("queries") or [])[:10]
@@ -239,6 +300,7 @@ def research_node(state: State) -> dict:
 
     return {"evidence": evidence}
 
+
 # -----------------------------
 # 5) Orchestrator (Plan)
 # -----------------------------
@@ -255,10 +317,11 @@ Grounding:
 - open_book: weekly/news roundup:
   - Set blog_kind="news_roundup"
   - No tutorial content unless requested
-  - If evidence is weak, plan should explicitly reflect that (don’t invent events).
+  - If evidence is weak, plan should explicitly reflect that (don't invent events).
 
 Output must match Plan schema.
 """
+
 
 def orchestrator_node(state: State) -> dict:
     planner = llm.with_structured_output(Plan)
@@ -308,6 +371,7 @@ def fanout(state: State):
         for task in state["plan"].tasks
     ]
 
+
 # -----------------------------
 # 7) Worker
 # -----------------------------
@@ -332,6 +396,7 @@ Grounding:
 Code:
 - If requires_code==true, include at least one minimal snippet.
 """
+
 
 def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
@@ -373,6 +438,7 @@ def worker_node(payload: dict) -> dict:
 
     return {"sections": [(task.id, section_md)]}
 
+
 # ============================================================
 # 8) ReducerWithImages (subgraph)
 #    merge_content -> decide_images -> generate_and_place_images
@@ -394,10 +460,12 @@ Rules:
 - Max 3 images total.
 - Each image must materially improve understanding (diagram/flow/table-like visual).
 - Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+- Each image filename must be a plain file name like qkv_flow.png (no folders, no "images/" prefix).
 - If no images needed: md_with_placeholders must equal input and images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
 Return strictly GlobalImagePlan.
 """
+
 
 def decide_images(state: State) -> dict:
     planner = llm.with_structured_output(GlobalImagePlan)
@@ -429,7 +497,7 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
     """
     Returns raw image bytes generated by Gemini.
     Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
+    Env var: GOOGLE_API_KEY (or GEMINI_API_KEY, mapped above)
     """
     from google import genai
     from google.genai import types
@@ -480,6 +548,14 @@ def _safe_slug(title: str) -> str:
     return s or "blog"
 
 
+def _write_blog_file(plan: Plan, md: str) -> None:
+    """Best-effort save so the 'Past blogs' list works. Never crash the run."""
+    try:
+        Path(f"{_safe_slug(plan.blog_title)}.md").write_text(md, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def generate_and_place_images(state: State) -> dict:
     plan = state["plan"]
     assert plan is not None
@@ -487,42 +563,30 @@ def generate_and_place_images(state: State) -> dict:
     md = state.get("md_with_placeholders") or state["merged_md"]
     image_specs = state.get("image_specs", []) or []
 
-    # If no images requested, just write merged markdown
-    if not image_specs:
-        filename = f"{_safe_slug(plan.blog_title)}.md"
-        Path(filename).write_text(md, encoding="utf-8")
-        return {"final": md}
-
-    images_dir = Path("images")
-    images_dir.mkdir(exist_ok=True)
-
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
 
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
-                continue
+        try:
+            img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+            # Cloudinary URL on Streamlit Cloud, local images/<name> otherwise
+            src = save_image(img_bytes, spec["filename"])
+        except Exception as e:
+            # graceful fallback: keep doc usable
+            prompt_block = (
+                f"> **[IMAGE GENERATION FAILED]** {spec.get('caption', '')}\n>\n"
+                f"> **Alt:** {spec.get('alt', '')}\n>\n"
+                f"> **Prompt:** {spec.get('prompt', '')}\n>\n"
+                f"> **Error:** {e}\n"
+            )
+            md = md.replace(placeholder, prompt_block)
+            continue
 
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        img_md = f"![{spec['alt']}]({src})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
-    filename = f"{_safe_slug(plan.blog_title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
+    _write_blog_file(plan, md)
     return {"final": md}
+
 
 # build reducer subgraph
 reducer_graph = StateGraph(State)
@@ -534,6 +598,7 @@ reducer_graph.add_edge("merge_content", "decide_images")
 reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
+
 
 # -----------------------------
 # 9) Build main graph
@@ -554,5 +619,3 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
-
