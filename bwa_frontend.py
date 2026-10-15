@@ -15,6 +15,17 @@ import streamlit as st
 # -----------------------------
 # Import your compiled LangGraph app
 # -----------------------------
+import os
+
+# Bridge Streamlit secrets -> environment variables.
+# Must run BEFORE importing bwa_backend, since it likely reads keys at import time.
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, str):
+            os.environ.setdefault(_k, _v)
+except Exception:
+    pass  # no secrets file locally -> backend falls back to your .env
+
 from bwa_backend import app
 
 
